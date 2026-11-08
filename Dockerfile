@@ -3,12 +3,17 @@
 
 FROM node:20-bookworm-slim
 
-# Dependências de sistema necessárias para algumas libs nativas usadas pelo Baileys
+# Dependências de sistema necessárias para algumas libs nativas usadas pelo Baileys.
+# "ca-certificates" é essencial: sem ele o git não consegue validar o certificado
+# SSL do GitHub ao baixar dependências via HTTPS (erro "server certificate
+# verification failed. CAfile: none CRLfile: none").
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     make \
     g++ \
     git \
+    ca-certificates \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
