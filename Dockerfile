@@ -13,6 +13,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# O Baileys depende internamente de um pacote (libsignal) hospedado no GitHub,
+# referenciado via protocolo git/ssh. Containers de build (como o do Railway)
+# não têm chave SSH configurada, o que faz o "npm install" falhar com o erro
+# "Could not read from remote repository". A correção é forçar o git a usar
+# HTTPS em vez de SSH/git:// para qualquer acesso ao GitHub.
+RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
+    && git config --global url."https://github.com/".insteadOf "git@github.com:" \
+    && git config --global url."https://".insteadOf "git://"
+
 COPY package.json ./
 RUN npm install --omit=dev
 
