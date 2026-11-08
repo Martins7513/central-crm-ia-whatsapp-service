@@ -19,11 +19,11 @@ RUN npm install --omit=dev
 COPY server.js ./
 
 # Pasta onde as sessões autenticadas do WhatsApp ficam salvas.
-# No Railway, monte um Volume apontando para este caminho para persistir
-# a sessão entre deploys/restarts (senão será necessário escanear o QR
-# novamente a cada novo deploy).
+# IMPORTANTE: o Railway NÃO aceita a instrução Docker "VOLUME" no Dockerfile
+# (ela é rejeitada na validação do build). Volumes persistentes no Railway
+# são configurados pela própria interface (Service → Settings → Volumes),
+# apontando o Mount Path para este mesmo caminho: /app/sessions
 RUN mkdir -p /app/sessions
-VOLUME ["/app/sessions"]
 
 ENV SESSIONS_DIR=/app/sessions
 ENV PORT=3000
