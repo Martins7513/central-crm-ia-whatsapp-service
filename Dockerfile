@@ -18,9 +18,12 @@ WORKDIR /app
 # não têm chave SSH configurada, o que faz o "npm install" falhar com o erro
 # "Could not read from remote repository". A correção é forçar o git a usar
 # HTTPS em vez de SSH/git:// para qualquer acesso ao GitHub.
+# IMPORTANTE: usamos "--add" nas regras repetidas porque "git config --global"
+# sem --add SOBRESCREVE uma regra "insteadOf" anterior com a mesma chave, em
+# vez de somar as duas — por isso a primeira tentativa não funcionou.
 RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
-    && git config --global url."https://github.com/".insteadOf "git@github.com:" \
-    && git config --global url."https://".insteadOf "git://"
+    && git config --global --add url."https://github.com/".insteadOf "git@github.com:" \
+    && git config --global --add url."https://".insteadOf "git://"
 
 COPY package.json ./
 RUN npm install --omit=dev
