@@ -190,7 +190,7 @@ async function startSession(sessionId) {
       await updateConnectionStatus(sessionId, {
         status: 'conectado', phone_number: sessions[sessionId].phone ? '+' + sessions[sessionId].phone : '',
         last_event: 'Conectado com sucesso', last_event_at: new Date().toISOString(),
-        connected_at: new Date().toISOString()
+        connected_at: new Date().toISOString(), disconnect_reason: ''
       });
     }
 
@@ -198,12 +198,21 @@ async function startSession(sessionId) {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
       sessions[sessionId].status = loggedOut ? 'desconectado' : 'erro';
-      sessions[sessionId].lastEvent = loggedOut ? 'Sessão encerrada (logout)' : `Conexão perdida (código ${statusCode})`;
+      sessions[sessionId].lastEvent = loggedOut
+        ? 'Sessão encerrada pelo WhatsApp (logout/possível bloqueio do número) — reconecte escaneando um novo QR Code'
+        : `Conexão perdida (código ${statusCode})`;
       sessions[sessionId].lastEventAt = new Date().toISOString();
-      await updateConnectionStatus(sessionId, {
-        status: sessions[sessionId].status, last_event: sessions[sessionId].lastEvent,
-        last_event_at: sessions[sessionId].lastEventAt
-      });
+      // IMPORTANTE: só marcamos como "desconexão automática" (logout_whatsapp/erro_conexao)
+      // quando o evento NÃO veio de um /disconnect manual (que já limpou a sessão antes
+      // deste callback poder disparar). Isso permite o painel avisar o usuário apenas
+      // quando foi o próprio WhatsApp que derrubou a sessão (ex: banimento/logout remoto).
+      if (sessions[sessionId]) {
+        await updateConnectionStatus(sessionId, {
+          status: sessions[sessionId].status, last_event: sessions[sessionId].lastEvent,
+          last_event_at: sessions[sessionId].lastEventAt,
+          disconnect_reason: loggedOut ? 'logout_whatsapp' : 'erro_conexao'
+        });
+      }
 
       if (!loggedOut) {
         // tenta reconectar automaticamente (falha transitória de rede)
@@ -234,9 +243,42 @@ app.get('/health', (req, res) => res.json({ ok: true, service: 'central-crm-ia-w
 app.post('/sessions/:id/start', authMiddleware, async (req, res) => {
   const sessionId = req.params.id;
   try {
-    if (!sessions[sessionId] || !sessions[sessionId].sock) {
+    const s = sessions[sessionId];
+    // IMPORTANTE: se a sessão anterior terminou em logout/erro, o socket antigo
+    // (e as credenciais salvas em disco) não servem mais para gerar um QR novo.
+    // Sem este bloco, clicar em "QR Code" após um bloqueio/logout não fazia nada
+    // (porque já havia um "sock", mesmo que encerrado). Agora, sempre que o status
+    // conhecido não for "conectando"/"aguardando_leitura"/"conectado", recomeçamos
+    // do zero (limpando credenciais antigas) para garantir um QR Code válido.
+    if (!s || !s.sock || ['desconectado', 'erro', 'nao_iniciada'].includes(s.status)) {
+      const sessionPath = path.join(SESSIONS_DIR, sessionId);
+      if (fs.existsSync(sessionPath)) fs.rmSync(sessionPath, { recursive: true, force: true });
+      delete sessions[sessionId];
       await startSession(sessionId);
     }
+    res.json({ ok: true, sessionId, status: sessions[sessionId]?.status || 'conectando' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// "Trocar número" / reconectar do zero: encerra a sessão atual (se existir) e
+// já inicia uma nova, pronta para escanear o QR Code com QUALQUER número
+// (o mesmo de antes ou um diferente). NÃO apaga nada no CRM além do próprio
+// registro de conexão (que o painel atualiza separadamente) — mensagens e
+// campanhas já gravadas continuam intactas, pois são vinculadas ao ID da
+// conexão (que não muda), nunca ao número de telefone em si.
+app.post('/sessions/:id/reset', authMiddleware, async (req, res) => {
+  const sessionId = req.params.id;
+  try {
+    const s = sessions[sessionId];
+    if (s?.sock) {
+      await s.sock.logout().catch(() => {});
+    }
+    delete sessions[sessionId];
+    const sessionPath = path.join(SESSIONS_DIR, sessionId);
+    if (fs.existsSync(sessionPath)) fs.rmSync(sessionPath, { recursive: true, force: true });
+    await startSession(sessionId);
     res.json({ ok: true, sessionId, status: sessions[sessionId]?.status || 'conectando' });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -311,7 +353,7 @@ app.post('/sessions/:id/send', authMiddleware, async (req, res) => {
   }
 });
 
-// Desconecta e remove a sessão (logout)
+// Desconecta e remove a sessão (logout manual, acionado pelo usuário no painel)
 app.post('/sessions/:id/disconnect', authMiddleware, async (req, res) => {
   const sessionId = req.params.id;
   const s = sessions[sessionId];
