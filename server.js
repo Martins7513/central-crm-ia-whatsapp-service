@@ -58,6 +58,13 @@ const SERVICE_SECRET = process.env.SERVICE_SECRET || '';
 // Usada para gravar diretamente nas tabelas "messages" e "whatsapp_connections" via Table API real.
 const CRM_BASE_URL = (process.env.CRM_BASE_URL || '').replace(/\/$/, '');
 const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(__dirname, 'sessions');
+// Intervalo mínimo (em segundos) entre dois envios na MESMA sessão/número.
+// IMPORTANTE: isto é um limite de taxa simples e transparente para reduzir o
+// risco de bloqueio em uso assistido por um atendente humano — não é uma
+// fila automatizada, nem simulação de comportamento humano (digitação,
+// horários aleatórios etc.), o que está fora do escopo deste serviço.
+// Ajustável via variável de ambiente MIN_SEND_INTERVAL_SECONDS no Railway.
+const MIN_SEND_INTERVAL_SECONDS = Math.max(1, parseInt(process.env.MIN_SEND_INTERVAL_SECONDS || '5', 10) || 5);
 
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 if (!SERVICE_SECRET) {
@@ -66,6 +73,7 @@ if (!SERVICE_SECRET) {
 if (!CRM_BASE_URL) {
   console.warn('[AVISO] CRM_BASE_URL não definida. O serviço vai rodar, mas não vai gravar mensagens/eventos de volta no CRM.');
 }
+console.log(`   Intervalo mínimo entre envios (MIN_SEND_INTERVAL_SECONDS): ${MIN_SEND_INTERVAL_SECONDS}s`);
 
 const logger = pino({ level: 'warn' });
 const app = express();
@@ -99,8 +107,22 @@ async function crmFetch(path, options) {
   return res.json().catch(() => null);
 }
 
+// IMPORTANTE: o método HTTP PATCH é bloqueado pela política de CORS do
+// ambiente de Hosted Deploy do CRM ("Method PATCH is not allowed by
+// Access-Control-Allow-Methods"), o que fazia essa atualização de status
+// falhar em silêncio. Correção: buscamos o registro atual (GET), mesclamos
+// com os campos alterados, e enviamos substituição completa via PUT (aceito
+// normalmente), preservando os campos não informados em "fields".
 async function updateConnectionStatus(sessionId, fields) {
-  await crmFetch(`whatsapp_connections/${sessionId}`, { method: 'PATCH', body: JSON.stringify(fields) });
+  let current = {};
+  try {
+    const res = await fetch(`${CRM_BASE_URL}/tables/whatsapp_connections/${sessionId}`);
+    if (res.ok) current = await res.json();
+  } catch (e) { /* segue só com os campos informados; o PUT abaixo reportará erro real se o registro não existir */ }
+  const merged = Object.assign({}, current, fields, { id: sessionId });
+  delete merged.gs_project_id;
+  delete merged.gs_table_name;
+  await crmFetch(`whatsapp_connections/${sessionId}`, { method: 'PUT', body: JSON.stringify(merged) });
 }
 
 async function recordIncomingMessage(sessionId, fromPhone, content) {
@@ -234,10 +256,23 @@ app.get('/sessions/:id/status', authMiddleware, (req, res) => {
   });
 });
 
-// Envia mensagem individual (uso assistido, não massificado)
+// Envia mensagem individual (uso assistido, não massificado).
+// Suporta texto simples, texto com link (o WhatsApp detecta e exibe como
+// clicável/com preview automaticamente — nenhum tratamento especial necessário)
+// e, opcionalmente, uma imagem com legenda via "mediaUrl" (URL pública
+// same-origin do CRM, ex: https://SEU-CRM/files/whatsapp-media/<id>).
+// NÃO há suporte a "botões" interativos reais (CTA/URL button): esse recurso
+// não é estável em sessões não oficiais e está fora do escopo deste serviço
+// (ver cabeçalho do arquivo — sem técnicas de evasão/instabilidade).
+//
+// LIMITE DE TAXA (anti-bloqueio): exige um intervalo mínimo de
+// MIN_SEND_INTERVAL_SECONDS entre dois envios na MESMA sessão. Isto é um
+// limite simples e transparente (rejeita com erro 429 se chamado cedo demais)
+// para reduzir o risco de bloqueio em uso assistido por humano — não é fila
+// automatizada nem simulação de comportamento humano.
 app.post('/sessions/:id/send', authMiddleware, async (req, res) => {
   const sessionId = req.params.id;
-  const { to, message } = req.body || {};
+  const { to, message, mediaUrl } = req.body || {};
   const s = sessions[sessionId];
 
   if (!s || !s.sock || s.status !== 'conectado') {
@@ -247,10 +282,30 @@ app.post('/sessions/:id/send', authMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'Informe "to" (telefone com DDI, ex: 5511999999999) e "message".' });
   }
 
+  const now = Date.now();
+  const minIntervalMs = MIN_SEND_INTERVAL_SECONDS * 1000;
+  if (s.lastSentAt && (now - s.lastSentAt) < minIntervalMs) {
+    const waitSeconds = Math.ceil((minIntervalMs - (now - s.lastSentAt)) / 1000);
+    return res.status(429).json({
+      error: `Aguarde ${waitSeconds}s antes de enviar outra mensagem (limite mínimo de ${MIN_SEND_INTERVAL_SECONDS}s entre envios, configurado para reduzir o risco de bloqueio desta sessão).`,
+      retryAfterSeconds: waitSeconds
+    });
+  }
+
   try {
     const jid = to.replace(/\D/g, '') + '@s.whatsapp.net';
-    await s.sock.sendMessage(jid, { text: message });
-    res.json({ ok: true, sentAt: new Date().toISOString() });
+    if (mediaUrl) {
+      // Baixa a imagem do CRM (same-origin, referência retornada pelo upload real
+      // via /files/) e envia como mídia com a mensagem como legenda.
+      const imgRes = await fetch(mediaUrl);
+      if (!imgRes.ok) throw new Error('Não foi possível baixar a imagem informada (status ' + imgRes.status + ')');
+      const buffer = Buffer.from(await imgRes.arrayBuffer());
+      await s.sock.sendMessage(jid, { image: buffer, caption: message });
+    } else {
+      await s.sock.sendMessage(jid, { text: message });
+    }
+    s.lastSentAt = Date.now();
+    res.json({ ok: true, sentAt: new Date().toISOString(), minIntervalSeconds: MIN_SEND_INTERVAL_SECONDS });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
